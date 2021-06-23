@@ -34,7 +34,7 @@ type Client struct {
 	header codec.Header
 	mu sync.Mutex
 	seq uint64           //请求编号
-	pending map[uint64]*Call
+	pending map[uint64]*Call  //保存待返回的请求
 	closing bool         //用户主动关闭标志
 	shutdown bool        //server has told us to stop
 }
@@ -131,9 +131,10 @@ func (client *Client)receive(){
 	var err error
 	for err == nil{
 		var h codec.Header
-		if err = client.cc.ReadHeader(&h);err != nil {
+		if err = client.cc.ReadHeader(&h);err != nil {     //此处会阻塞直到有数据返回
 			break
 		}
+
 		call := client.removeCall(h.Seq)
 		switch{
 		case call == nil:     //call不存在
