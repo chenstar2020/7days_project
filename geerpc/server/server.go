@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"geerpc/codec"
 	"geerpc/common"
@@ -10,12 +11,13 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
 
 type Server struct{
-
+	serviceMap sync.Map
 }
 
 //NewServer returns a new Server
@@ -24,6 +26,39 @@ func NewServer()*Server{
 }
 
 var DefaultServer = NewServer()
+
+//Register publishes in the server the set of methods of the
+func (server *Server)Register(rcvr interface{})error{
+	var foo Foo
+	s := newService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup{  //要放在newService之前吧
+		return errors.New("rpc: service already defined:" + s.name)
+	}
+	return nil
+}
+
+func (server *Server)findService(serviceMethod string)(svc *service, mtype *methodType, err error){
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed:" + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok{
+		err = errors.New("rpc server: cant't find service " + serviceName)
+		return
+	}
+	fmt.Println("afadfadfda", serviceName, methodName)
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil{
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
 
 //Accept accepts connections on the listener and serves requests
 //for each incoming connections
@@ -93,7 +128,10 @@ func (server *Server)serverCodec(cc codec.Codec){
 type request struct {
 	h *codec.Header              //header
 	argv, replyv reflect.Value   //body
+	mtype *methodType
+	svc   *service
 }
+
 
 //读取header
 func (server *Server)readRequestHeader(cc codec.Codec)(*codec.Header, error){
@@ -114,10 +152,23 @@ func (server *Server)readRequest(cc codec.Codec)(*request, error){
 		return nil, err
 	}
 	req := &request{h:h}
-	//读取body
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil{
-		log.Println("rpc server: read argv err:", err)
+	fmt.Println("rrrrrrrrrrr", req.h.ServiceMethod)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)        //找到处理函数
+	if err != nil{
+		return req, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	argvi := req.argv.Interface()
+	fmt.Println("aaaaaaaaaaaaaa", req.argv.Interface(), req.replyv)
+	if req.argv.Type().Kind() != reflect.Ptr{
+		argvi = req.argv.Addr().Interface()
+	}
+	fmt.Println("ffffffffffffff", argvi)
+	if err = cc.ReadBody(argvi); err != nil{
+		log.Println("rpc server: read body err:", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -133,8 +184,13 @@ func (server *Server)sendResponse(cc codec.Codec, h *codec.Header, body interfac
 
 func (server *Server)handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup){
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())  //暂时先打印出来  还要正式调用接口处理
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
@@ -146,7 +202,7 @@ type methodType struct {
 	method reflect.Method    //保存方法
 	ArgType reflect.Type
 	ReplyType reflect.Type
-	numCalls uint64
+	numCalls uint64          //被调用次数
 }
 
 func (m *methodType)NumCalls()uint64{
@@ -184,13 +240,15 @@ type service struct {
 
 func newService(rcvr interface{})*service{
 	s := new(service)
+	//解析参数
 	s.rcvr = reflect.ValueOf(rcvr)
 	s.name = reflect.Indirect(s.rcvr).Type().Name()
 	s.typ = reflect.TypeOf(rcvr)
 	if !ast.IsExported(s.name){
 		log.Fatalf("rpc server: %s is not a valid service name",s.name)
 	}
-	s
+    s.registerMethods()
+	return s
 }
 
 func (s *service)registerMethods(){
@@ -201,10 +259,11 @@ func (s *service)registerMethods(){
 		if mType.NumIn() != 3 || mType.NumOut() != 1{
 			continue
 		}
-		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem(){
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem(){  //返回值是否为error
 			continue
 		}
 		argType, replyType := mType.In(1), mType.In(2)
+		fmt.Println("zzzzzaaaaaa", argType, replyType)
 		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType){
 			continue
 		}
@@ -220,4 +279,17 @@ func (s *service)registerMethods(){
 func isExportedOrBuiltinType(t reflect.Type)bool{
 	return ast.IsExported(t.Name()) || t.PkgPath() == ""
 }
+
+func (s *service)call(m *methodType, argv, replyv reflect.Value) error{
+	atomic.AddUint64(&m.numCalls, 1)      //原子操作
+	f := m.method.Func
+
+	returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
+	if errInter := returnValues[0].Interface(); errInter != nil{
+		return errInter.(error)
+	}
+	return nil
+}
+
+
 
