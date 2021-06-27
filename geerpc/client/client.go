@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 //Call represents an active RPC
@@ -203,7 +205,7 @@ func parseOptions(opts ...*common.Option)(*common.Option, error){  //为啥要�
 }
 
 func Dial(network, address string, opts ...*common.Option)(client *Client, err error){
-	opt, err := parseOptions(opts...)
+/*	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +219,8 @@ func Dial(network, address string, opts ...*common.Option)(client *Client, err e
 		}
 	}()
 
-	return NewClient(conn, opt)
+	return NewClient(conn, opt)*/
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 
@@ -238,7 +241,53 @@ func (client *Client)Go(serviceMethod string, args, reply interface{}, done chan
 	return call
 }
 
-func (client *Client)Call(serviceMethod string, args, reply interface{})error{
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client)Call(ctx context.Context, serviceMethod string, args, reply interface{})error{
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select{
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed:" + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
+}
+
+
+type clientResult struct{
+	client *Client
+	err error
+}
+
+type newClientFunc func(conn net.Conn, opt *common.Option)(client *Client, err error)
+
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*common.Option)(client *Client, err error){
+	opt, err := parseOptions(opts...)
+	if err != nil{
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil{
+		return nil, err
+	}
+	defer func() {
+		if err != nil{
+			_ = conn.Close()
+		}
+	}()
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client:client, err:err}
+	}()
+	if opt.ConnectTimeout == 0 {  //不限制等待时间 直到返回响应
+		result := <-ch
+		return result.client, result.err
+	}
+	select{
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client:connect: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
 }

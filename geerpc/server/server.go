@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Server struct{
@@ -29,7 +30,6 @@ var DefaultServer = NewServer()
 
 //Register publishes in the server the set of methods of the
 func (server *Server)Register(rcvr interface{})error{
-	var foo Foo
 	s := newService(rcvr)
 	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup{  //要放在newService之前吧
 		return errors.New("rpc: service already defined:" + s.name)
@@ -49,7 +49,7 @@ func (server *Server)findService(serviceMethod string)(svc *service, mtype *meth
 		err = errors.New("rpc server: cant't find service " + serviceName)
 		return
 	}
-	fmt.Println("afadfadfda", serviceName, methodName)
+
 	svc = svci.(*service)
 	mtype = svc.method[methodName]
 	if mtype == nil{
@@ -118,7 +118,7 @@ func (server *Server)serverCodec(cc codec.Codec){
 			continue
 		}
 		wg.Add(1)       //请求method可以有多个
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, 5 * time.Second)
 	}
 	wg.Wait()   //等待所有请求处理完成
 	_ = cc.Close()
@@ -152,7 +152,7 @@ func (server *Server)readRequest(cc codec.Codec)(*request, error){
 		return nil, err
 	}
 	req := &request{h:h}
-	fmt.Println("rrrrrrrrrrr", req.h.ServiceMethod)
+
 	req.svc, req.mtype, err = server.findService(h.ServiceMethod)        //找到处理函数
 	if err != nil{
 		return req, err
@@ -161,15 +161,15 @@ func (server *Server)readRequest(cc codec.Codec)(*request, error){
 	req.replyv = req.mtype.newReplyv()
 
 	argvi := req.argv.Interface()
-	fmt.Println("aaaaaaaaaaaaaa", req.argv.Interface(), req.replyv)
 	if req.argv.Type().Kind() != reflect.Ptr{
 		argvi = req.argv.Addr().Interface()
 	}
-	fmt.Println("ffffffffffffff", argvi)
+
 	if err = cc.ReadBody(argvi); err != nil{
 		log.Println("rpc server: read body err:", err)
 		return req, err
 	}
+
 	return req, nil
 }
 
@@ -182,16 +182,38 @@ func (server *Server)sendResponse(cc codec.Codec, h *codec.Header, body interfac
 	}
 }
 
-func (server *Server)handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup){
+func (server *Server)handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration){
 	defer wg.Done()
+	called := make(chan struct{})
+	sent := make(chan struct{})
 
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)  //调用计算函数
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	if timeout == 0{
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+
+	select{
+	case <-time.After(timeout): //调用函数或者发送响应的地方阻塞了
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		fmt.Println("server handle function timeout")
+		<-sent
+	}
 }
 
 func Accept(lis net.Listener){
@@ -200,8 +222,8 @@ func Accept(lis net.Listener){
 
 type methodType struct {
 	method reflect.Method    //保存方法
-	ArgType reflect.Type
-	ReplyType reflect.Type
+	ArgType reflect.Type     //请求参数
+	ReplyType reflect.Type   //返回参数
 	numCalls uint64          //被调用次数
 }
 
@@ -253,6 +275,7 @@ func newService(rcvr interface{})*service{
 
 func (s *service)registerMethods(){
 	s.method = make(map[string]*methodType)
+
 	for i := 0;i < s.typ.NumMethod(); i++ {
 		method := s.typ.Method(i)
 		mType := method.Type
@@ -263,7 +286,7 @@ func (s *service)registerMethods(){
 			continue
 		}
 		argType, replyType := mType.In(1), mType.In(2)
-		fmt.Println("zzzzzaaaaaa", argType, replyType)
+
 		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType){
 			continue
 		}
@@ -288,6 +311,7 @@ func (s *service)call(m *methodType, argv, replyv reflect.Value) error{
 	if errInter := returnValues[0].Interface(); errInter != nil{
 		return errInter.(error)
 	}
+	time.Sleep(time.Second * 10)
 	return nil
 }
 
