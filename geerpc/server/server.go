@@ -8,8 +8,8 @@ import (
 	"geerpc/common"
 	"go/ast"
 	"io"
-	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -66,33 +66,34 @@ func (server *Server)Accept(lis net.Listener){
 	for {
 		conn, err := lis.Accept()
 		if err != nil{
-			log.Println("rpc server: accept error:", err)
+			fmt.Println("rpc server: accept error:", err)
 			continue
 		}
 
-		go server.ServerConn(conn)  //处理连接
+		go server.ServeConn(conn)  //处理连接
 	}
 }
 
-func (server *Server)ServerConn(conn io.ReadWriteCloser){
+func (server *Server)ServeConn(conn io.ReadWriteCloser){
 	defer func() {
 		_ = conn.Close()
 	}()
 
 	var opt common.Option
 	if err := json.NewDecoder(conn).Decode(&opt); err != nil {
-		log.Println("rpc server: options error:", err)
+		fmt.Println("rpc server: options error:", err)
 		return
 	}
+
 	//校验请求类型
 	if opt.MagicNumber != common.MagicNumber{
-		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
+		fmt.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
 		return
 	}
 	//得到解码器
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil{
-		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
+		fmt.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
 	//开始解码数据
@@ -118,7 +119,7 @@ func (server *Server)serverCodec(cc codec.Codec){
 			continue
 		}
 		wg.Add(1)       //请求method可以有多个
-		go server.handleRequest(cc, req, sending, wg, 5 * time.Second)
+		go server.handleRequest(cc, req, sending, wg, 3 * time.Second)
 	}
 	wg.Wait()   //等待所有请求处理完成
 	_ = cc.Close()
@@ -138,7 +139,7 @@ func (server *Server)readRequestHeader(cc codec.Codec)(*codec.Header, error){
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
 		if err != io.EOF && err != io.ErrUnexpectedEOF{
-			log.Println("rpc server: read header error:", err)
+			fmt.Println("rpc server: read header error:", err)
 		}
 		return nil, err
 	}
@@ -166,7 +167,7 @@ func (server *Server)readRequest(cc codec.Codec)(*request, error){
 	}
 
 	if err = cc.ReadBody(argvi); err != nil{
-		log.Println("rpc server: read body err:", err)
+		fmt.Println("rpc server: read body err:", err)
 		return req, err
 	}
 
@@ -178,7 +179,7 @@ func (server *Server)sendResponse(cc codec.Codec, h *codec.Header, body interfac
 	defer sending.Unlock()   //串行发送响应 防止数据混乱
 
 	if err := cc.Write(h, body); err != nil{
-		log.Println("rpc server: write response error:", err)
+		fmt.Println("rpc server: write response error:", err)
 	}
 }
 
@@ -211,7 +212,6 @@ func (server *Server)handleRequest(cc codec.Codec, req *request, sending *sync.M
 		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
 		server.sendResponse(cc, req.h, invalidRequest, sending)
 	case <-called:
-		fmt.Println("server handle function timeout")
 		<-sent
 	}
 }
@@ -267,7 +267,7 @@ func newService(rcvr interface{})*service{
 	s.name = reflect.Indirect(s.rcvr).Type().Name()
 	s.typ = reflect.TypeOf(rcvr)
 	if !ast.IsExported(s.name){
-		log.Fatalf("rpc server: %s is not a valid service name",s.name)
+		fmt.Printf("rpc server: %s is not a valid service name",s.name)
 	}
     s.registerMethods()
 	return s
@@ -295,7 +295,7 @@ func (s *service)registerMethods(){
 			ArgType: argType,
 			ReplyType: replyType,
 		}
-		log.Printf("rpc server: register %s.%s\n", s.name, method.Name)
+		fmt.Printf("rpc server: register %s.%s\n", s.name, method.Name)
 	}
 }
 
@@ -311,9 +311,38 @@ func (s *service)call(m *methodType, argv, replyv reflect.Value) error{
 	if errInter := returnValues[0].Interface(); errInter != nil{
 		return errInter.(error)
 	}
-	time.Sleep(time.Second * 10)
 	return nil
 }
 
 
 
+
+//********************支持HTTP***********************
+
+func (server *Server)ServeHTTP(w http.ResponseWriter, req *http.Request){
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil{
+		fmt.Print("rpc hijacking", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+
+	_, _ = io.WriteString(conn, "HTTP/1.0 " + common.Connected + "\n\n")      //这里HTTP/1.0之后的空格很重要
+	server.ServeConn(conn)
+}
+
+func (server *Server)HandleHTTP(){
+	http.Handle(common.DefaultRPCPath, server)
+	http.Handle(common.DefaultDebugPath, debugHTTP{server})
+	fmt.Println("rpc server debug path:", common.DefaultDebugPath)
+}
+
+func HandleHTTP(){
+	DefaultServer.HandleHTTP()
+}

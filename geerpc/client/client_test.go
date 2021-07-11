@@ -33,3 +33,8 @@ func TestClient_dialTimeout(t *testing.T) {
 		_assert(err == nil, "0 means no limit")
 	})
 }
+
+
+func TestXDial(t *testing.T) {
+
+}

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,8 +9,9 @@ import (
 	"geerpc/codec"
 	"geerpc/common"
 	"io"
-	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -160,12 +162,12 @@ func NewClient(conn net.Conn, opt *common.Option)(*Client, error){
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil{
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
-		log.Println("rpc client:codec error:", err)
+		fmt.Println("rpc client:codec error:", err)
 		return nil, err
 	}
 
 	if err := json.NewEncoder(conn).Encode(opt); err != nil{  //将编码类型封装进报文
-		log.Println("rpc client:options error:", err)
+		fmt.Println("rpc client:options error:", err)
 		_ = conn.Close()
 		return nil, err
 	}
@@ -229,7 +231,7 @@ func (client *Client)Go(serviceMethod string, args, reply interface{}, done chan
 	if done == nil{
 		done = make(chan *Call, 10)
 	}else if cap(done) == 0{
-		log.Panic("rpc client: done channel is unbuffered")
+		fmt.Println("rpc client: done channel is unbuffered")
 	}
 	call := &Call{
 		ServiceMethod: serviceMethod,
@@ -291,3 +293,41 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*common.Optio
 		return result.client, result.err
 	}
 }
+
+
+
+//******************支持HTTP********************
+
+func NewHTTPClient(conn net.Conn, opt *common.Option)(*Client, error){
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", common.DefaultRPCPath))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method:"CONNECT"})
+	if err == nil && resp.Status == common.Connected{
+		return NewClient(conn, opt)
+	}
+
+	if err == nil{
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+func DialHTTP(network, address string, opts ...*common.Option)(*Client, error){
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+func XDial(rpcAddr string, opts ...*common.Option)(*Client, error){
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2{
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+
+	protocol, addr := parts[0], parts[1]
+	switch protocol{
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		return Dial(protocol, addr, opts...)
+	}
+}
+

@@ -19,3 +19,10 @@ var DefaultOption = &Option{
 	CodecType: codec.GobType,
 	ConnectTimeout: time.Second *10,
 }
+
+
+const (
+	Connected = "200 Connected to Gee RPC"
+	DefaultRPCPath = "/_geeprc_"
+	DefaultDebugPath = "/debug/geerpc"
+)
